@@ -54,7 +54,7 @@ static TaskHandle_t _spp_task_handle = NULL;
 static EventGroupHandle_t _spp_event_group = NULL;
 static EventGroupHandle_t _bt_event_group = NULL;
 static boolean secondConnectionAttempt;
-static esp_spp_cb_t * custom_spp_callback = NULL;
+static esp_spp_cb_t custom_spp_callback = NULL;
 static BluetoothSerialDataCb custom_data_callback = NULL;
 static esp_bd_addr_t current_bd_addr;
 static ConfirmRequestCb confirm_request_callback = NULL;
@@ -89,6 +89,7 @@ static BTAdvertisedDeviceCb advertisedDeviceCb = nullptr;
 #define SPP_DISCONNECTED 0x08
 // true until connect(), changes to true on CLOSE
 #define SPP_CLOSED      0x10
+#define SPP_UNINITIALIZED 0x20
 
 // _bt_event_group
 #define BT_DISCOVERY_RUNNING    0x01
@@ -136,6 +137,7 @@ static bool get_name_from_eir(uint8_t *eir, char *bdname, uint8_t *bdname_len)
         *bdname_len = rmt_bdname_len;
         return true;
     }
+    log_i("get_name_from_eir: no rmt_bdname");
     return false;
 }
 
@@ -261,18 +263,23 @@ static void esp_spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
     {
     case ESP_SPP_INIT_EVT:
         log_i("ESP_SPP_INIT_EVT");
+        if (_isMaster) {
 #ifdef ESP_IDF_VERSION_MAJOR
-        esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+            esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
 #else
-        esp_bt_gap_set_scan_mode(ESP_BT_SCAN_MODE_CONNECTABLE_DISCOVERABLE);
+            esp_bt_gap_set_scan_mode(ESP_BT_SCAN_MODE_CONNECTABLE_DISCOVERABLE);
 #endif
-        if (!_isMaster) {
             log_i("ESP_SPP_INIT_EVT: slave: start");
             esp_spp_start_srv(ESP_SPP_SEC_NONE, ESP_SPP_ROLE_SLAVE, 0, _spp_server_name);
         }
         xEventGroupSetBits(_spp_event_group, SPP_RUNNING);
+        xEventGroupClearBits(_spp_event_group, SPP_UNINITIALIZED);
         break;
-
+    case ESP_SPP_UNINIT_EVT:
+        log_i("ESP_SPP_UNINIT_EVT");
+        xEventGroupClearBits(_spp_event_group, SPP_RUNNING);
+        xEventGroupSetBits(_spp_event_group, SPP_UNINITIALIZED);
+        break;
     case ESP_SPP_SRV_OPEN_EVT://Server connection open
         if (param->srv_open.status == ESP_SPP_SUCCESS) {
             log_i("ESP_SPP_SRV_OPEN_EVT: %u", _spp_client);
@@ -301,8 +308,8 @@ static void esp_spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
                 xEventGroupSetBits(_spp_event_group, SPP_DISCONNECTED);
                 xEventGroupSetBits(_spp_event_group, SPP_CONGESTED);
                 xEventGroupSetBits(_spp_event_group, SPP_CLOSED);
+                xEventGroupClearBits(_spp_event_group, SPP_CONNECTED);
             }        
-            xEventGroupClearBits(_spp_event_group, SPP_CONNECTED);
         } else {
             log_e("ESP_SPP_CLOSE_EVT failed!, status:%d", param->close.status);
         }
@@ -429,8 +436,9 @@ static void esp_bt_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *pa
             uint8_t peer_bdname_len = 0;
             char peer_bdname[ESP_BT_GAP_MAX_BDNAME_LEN + 1];
             for (int i = 0; i < param->disc_res.num_prop; i++) {
+//                log_i("ESP_BT_GAP_DISC_RES_EVT type:%d", param->disc_res.prop[i].type);
                 switch(param->disc_res.prop[i].type) {
-                    case ESP_BT_GAP_DEV_PROP_EIR:  
+                    case ESP_BT_GAP_DEV_PROP_EIR:
                         if (get_name_from_eir((uint8_t*)param->disc_res.prop[i].val, peer_bdname, &peer_bdname_len)) {
                             log_i("ESP_BT_GAP_DISC_RES_EVT : EIR : %s : %d", peer_bdname, peer_bdname_len);
                             if (strlen(_remote_name) == peer_bdname_len
@@ -441,6 +449,8 @@ static void esp_bt_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *pa
                                 esp_bt_gap_cancel_discovery();
                                 esp_spp_start_discovery(_peer_bd_addr);
                             }
+                        } else {
+                            log_i("ESP_BT_GAP_DISC_RES_EVT : EIR failed");
                         }
                         break;
 
@@ -495,6 +505,7 @@ static void esp_bt_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *pa
             advertisedDevice.setAddress(BTAddress(addr));
             if (scanResults.add(advertisedDevice) && advertisedDeviceCb)
                 advertisedDeviceCb(&advertisedDevice);
+            log_i("ESP_BT_GAP_DISC_RES_EVT done");
         }
         break;
 
@@ -580,7 +591,7 @@ static void esp_bt_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *pa
             break;
 
         case ESP_BT_GAP_MODE_CHG_EVT:
-            log_i("ESP_BT_GAP_MODE_CHG_EVT: mode: %d", param->mode_chg.mode);
+            log_i("ESP_BT_GAP_MODE_CHG_EVT: remote addr: %s, mode: %d", bda2str(param->mode_chg.bda, bda_str, sizeof(bda_str)), param->mode_chg.mode);
             break;
 
         default:
@@ -589,7 +600,7 @@ static void esp_bt_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *pa
     }
 }
 
-static bool _init_bt(const char *deviceName)
+static bool _init_bt(const char *deviceName, bt_mode mode)
 {
     if(!_bt_event_group){
         _bt_event_group = xEventGroupCreate();
@@ -609,6 +620,7 @@ static bool _init_bt(const char *deviceName)
         xEventGroupSetBits(_spp_event_group, SPP_CONGESTED);
         xEventGroupSetBits(_spp_event_group, SPP_DISCONNECTED);
         xEventGroupSetBits(_spp_event_group, SPP_CLOSED);
+        xEventGroupSetBits(_spp_event_group, SPP_UNINITIALIZED);
     }
     if (_spp_rx_queue == NULL){
         _spp_rx_queue = xQueueCreate(RX_QUEUE_SIZE, sizeof(uint8_t)); //initialize the queue
@@ -641,7 +653,7 @@ static bool _init_bt(const char *deviceName)
         }
     }
 
-    if (!btStarted() && !btStart()){
+    if (!btStarted() && !btStartMode(mode)){
         log_e("initialize controller failed");
         return false;
     }
@@ -661,8 +673,6 @@ static bool _init_bt(const char *deviceName)
         }
     }
 
-    // Why only master need this?  Slave need this during pairing as well
-//    if (_isMaster && esp_bt_gap_register_callback(esp_bt_gap_cb) != ESP_OK) {
     if (esp_bt_gap_register_callback(esp_bt_gap_cb) != ESP_OK) {
         log_e("gap register failed");
         return false;
@@ -715,6 +725,12 @@ static bool _stop_bt()
         if(_spp_client)
             esp_spp_disconnect(_spp_client);
         esp_spp_deinit();
+        log_w("_stop_bt waiting for UNINT");
+        TickType_t xTicksToWait = READY_TIMEOUT / portTICK_PERIOD_MS;
+        if(! (xEventGroupWaitBits(_spp_event_group, SPP_UNINITIALIZED, pdFALSE, pdFALSE, xTicksToWait) )) {
+            log_w("_stop_bt error waiting for UNINT");
+        }
+        log_w("_stop_bt wait for UNINT done");
         esp_bluedroid_disable();
         esp_bluedroid_deinit();
         btStop();
@@ -768,6 +784,7 @@ static bool waitForConnect(int timeout) {
 
 static bool waitForDiscovered(int timeout) {
     TickType_t xTicksToWait = timeout / portTICK_PERIOD_MS;
+	#warning falsche group?
     return (xEventGroupWaitBits(_spp_event_group, BT_DISCOVERY_COMPLETED, pdFALSE, pdTRUE, xTicksToWait) & BT_DISCOVERY_COMPLETED) != 0;
 }
 
@@ -776,11 +793,10 @@ static bool waitForSDPRecord(int timeout) {
     return (xEventGroupWaitBits(_bt_event_group, BT_SDP_COMPLETED, pdFALSE, pdTRUE, xTicksToWait) & BT_SDP_COMPLETED) != 0;
 }
 
-/*
+/**
  * Serial Bluetooth Arduino
  *
- * */
-
+ */
 BluetoothSerial::BluetoothSerial()
 {
     local_name = "ESP32"; //default bluetooth name
@@ -792,15 +808,17 @@ BluetoothSerial::~BluetoothSerial(void)
 }
 
 /**
- * @Param isMaster set to true if you want to connect to an other device
+ * @param isSlave true if you want to connect to an other device
+ *                false if you want to create a bluetooth master device where other devices can connect to.
  */
-bool BluetoothSerial::begin(String localName, bool isMaster)
+bool BluetoothSerial::begin(String localName, bool noServer, bool disableBLE)
 {
-    _isMaster = isMaster;
+    log_i("BluetoothSerial::begin(%s,%d,%d)", localName.c_str(), noServer, disableBLE);
+    _isMaster = ! noServer;
     if (localName.length()){
         local_name = localName;
     }
-    return _init_bt(local_name.c_str());
+    return _init_bt(local_name.c_str(), disableBLE ? BT_MODE_CLASSIC_BT : BT_MODE_BTDM);
 }
 
 int BluetoothSerial::available(void)
@@ -865,9 +883,20 @@ void BluetoothSerial::flush()
     }
 }
 
+/**
+ * stops bluetooth, if bt isn't needed any more until reset memrelease() can be called to free additional ram
+ */
 void BluetoothSerial::end()
 {
     _stop_bt();
+}
+
+/**
+ * free additional ~30kB ram, reset is required to enable BT again
+ */
+void BluetoothSerial::memrelease()
+{
+    esp_bt_mem_release(ESP_BT_MODE_BTDM);
 }
 
 void BluetoothSerial::onConfirmRequest(ConfirmRequestCb cb)
@@ -886,7 +915,7 @@ void BluetoothSerial::confirmReply(boolean confirm)
 }
 
 
-esp_err_t BluetoothSerial::register_callback(esp_spp_cb_t * callback)
+esp_err_t BluetoothSerial::register_callback(esp_spp_cb_t callback)
 {
     custom_spp_callback = callback;
     return ESP_OK;
@@ -896,10 +925,11 @@ esp_err_t BluetoothSerial::register_callback(esp_spp_cb_t * callback)
 void BluetoothSerial::enableSSP() {
     _enableSSP = true;
 }
-/*
-     * Set default parameters for Legacy Pairing
-     * Use fixed pin code
-*/
+
+/**
+ * Set default parameters for Legacy Pairing
+ * Use fixed pin code
+ */
 bool BluetoothSerial::setPin(const char *pin) {
     log_i("pin: %s", pin);
     bool isEmpty =  !(pin  && *pin);
@@ -921,6 +951,8 @@ bool BluetoothSerial::setPin(const char *pin) {
 
 bool BluetoothSerial::connect(String remoteName)
 {
+    bool retval = false;
+
     if (!isReady(true, READY_TIMEOUT)) return false;
     if (remoteName && remoteName.length() < 1) {
         log_e("No remote name is provided");
@@ -935,29 +967,37 @@ bool BluetoothSerial::connect(String remoteName)
     _remote_name[ESP_BT_GAP_MAX_BDNAME_LEN] = 0;
     log_i("master : remoteName");
     // will first resolve name to address
+    /*
 #ifdef ESP_IDF_VERSION_MAJOR
         esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
 #else
         esp_bt_gap_set_scan_mode(ESP_BT_SCAN_MODE_CONNECTABLE_DISCOVERABLE);
 #endif
+*/
     xEventGroupClearBits(_spp_event_group, SPP_CLOSED);
     if (esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, INQ_LEN, INQ_NUM_RSPS) == ESP_OK) {
-        return waitForConnect(SCAN_TIMEOUT);
+        retval = waitForConnect(SCAN_TIMEOUT);
     }
-    return false;
+    if (retval == false) {
+      _isRemoteAddressSet = false;
+    }
+    return retval;
 }
 
 /**
- * @Param channel: specify channel or 0 for auto-detect
- * @Param sec_mask:
+ * Connect to an other bluetooth device
+ * 
+ * @param channel specify channel or 0 for auto-detect
+ * @param sec_mask
  *           ESP_SPP_SEC_ENCRYPT|ESP_SPP_SEC_AUTHENTICATE
  *           ESP_SPP_SEC_NONE
- * @Param role:
+ * @param role
  *           ESP_SPP_ROLE_MASTER   master can handle up to 7 connections to slaves
  *           ESP_SPP_ROLE_SLAVE    can only have one connection to a master
  */
 bool BluetoothSerial::connect(uint8_t remoteAddress[], int channel, esp_spp_sec_t sec_mask, esp_spp_role_t role)
 {
+    bool retval = false;
     if (!isReady(true, READY_TIMEOUT)) return false;
     if (!remoteAddress) {
         log_e("No remote address is provided");
@@ -973,16 +1013,18 @@ bool BluetoothSerial::connect(uint8_t remoteAddress[], int channel, esp_spp_sec_
     log_i("master : remoteAddress");
     xEventGroupClearBits(_spp_event_group, SPP_CLOSED);
     if (channel > 0) {
+#if (ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO)
         char bda_str[18];
         log_i("spp connect to remote %s channel %d",
             bda2str(_peer_bd_addr, bda_str, sizeof(bda_str)),
             channel);
+#endif
         if(esp_spp_connect(sec_mask, role, channel, _peer_bd_addr) != ESP_OK ) {
 			log_e("spp connect failed");
-			return false;
-		}
-        bool rc=waitForConnect(READY_TIMEOUT);
-        if(rc) {
+      retval = false;
+    } else {
+      retval = waitForConnect(READY_TIMEOUT);
+      if(retval) {
             log_i("connected");
         } else {
             if(this->isClosed()) {
@@ -991,12 +1033,15 @@ bool BluetoothSerial::connect(uint8_t remoteAddress[], int channel, esp_spp_sec_
                 log_e("connect timed out after %dms", READY_TIMEOUT);
             }
         }
-        return rc;
     }
-    if (esp_spp_start_discovery(_peer_bd_addr) == ESP_OK) {
-        return waitForConnect(READY_TIMEOUT);
+  } else if (esp_spp_start_discovery(_peer_bd_addr) == ESP_OK) {
+    retval = waitForConnect(READY_TIMEOUT);
+  }
+
+  if (!retval) {
+    _isRemoteAddressSet = false;
     }
-    return false;
+    return retval;
 }
 
 bool BluetoothSerial::connect()
@@ -1015,11 +1060,13 @@ bool BluetoothSerial::connect()
         disconnect();
         log_i("master : remoteName");
         // will resolve name to address first - it may take a while
+        /*
 #ifdef ESP_IDF_VERSION_MAJOR
         esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
 #else
         esp_bt_gap_set_scan_mode(ESP_BT_SCAN_MODE_CONNECTABLE_DISCOVERABLE);
 #endif
+*/
         if (esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, INQ_LEN, INQ_NUM_RSPS) == ESP_OK) {
             return waitForConnect(SCAN_TIMEOUT);
         }
@@ -1030,6 +1077,7 @@ bool BluetoothSerial::connect()
 }
 
 bool BluetoothSerial::disconnect() {
+    _isRemoteAddressSet=false;
     if (_spp_client) {
         flush();
         log_i("disconnecting");
@@ -1054,6 +1102,19 @@ bool BluetoothSerial::connected(int timeout) {
 }
 
 /**
+ * @brief hide this device or make it discoverable
+ * 
+ * @param discoverable true => other devices can find this device, this is not needed if we are scanning for other devices!
+ *                     false => hide this device, if we want to connect to other devices nobody needs to see this device.
+ */
+void BluetoothSerial::setDiscoverable(bool discoverable) {
+    log_i("setDiscoverable: %d", discoverable);
+    // hint: isMaster is set in begin(), means we want to connect to other devices
+    esp_bt_gap_set_scan_mode(_isMaster ? ESP_BT_CONNECTABLE : ESP_BT_NON_CONNECTABLE,
+      discoverable ? ESP_BT_GENERAL_DISCOVERABLE : ESP_BT_NON_DISCOVERABLE);
+}
+
+/**
  * true if a connection terminated or a connection attempt failed
  */
 bool BluetoothSerial::isClosed() {
@@ -1061,7 +1122,7 @@ bool BluetoothSerial::isClosed() {
 }
 
 bool BluetoothSerial::isReady(bool checkMaster, int timeout) {
-    if (checkMaster && !_isMaster) {
+    if (checkMaster && _isMaster) {
         log_e("Master mode is not active. Call begin(localName, true) to enable Master mode");
         return false;
     }
@@ -1089,7 +1150,7 @@ BTScanResults* BluetoothSerial::discover(int timeoutMs) {
     disconnect();
     log_i("discovering");
     // will resolve name to address first - it may take a while
-    esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+    //esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
     if (esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, timeout, 0) == ESP_OK) {
         waitForDiscovered(timeoutMs);
         log_i("gap_cancel_discovery()");
@@ -1108,17 +1169,27 @@ BTScanResults* BluetoothSerial::discover(int timeoutMs) {
  */
 bool BluetoothSerial::discoverAsync(BTAdvertisedDeviceCb cb, int timeoutMs) {
     scanResults.clear();
-    if (strlen(_remote_name) || _isRemoteAddressSet)
+    if (strlen(_remote_name) || _isRemoteAddressSet) {
+        log_i("discoverAsync: remoteAddr already set: %s %d", _remote_name, _isRemoteAddressSet);
         return false;
+    }
     int timeout = timeoutMs / INQ_TIME;
+    if(timeout==0)
+      timeout=ESP_BT_GAP_MAX_INQ_LEN;
     disconnect();
     advertisedDeviceCb = cb;
     log_i("discovering");
     // will resolve name to address first - it may take a while
-    esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
-    if (timeout > 0)
-        return esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, timeout, 0) == ESP_OK;
-    else return esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, ESP_BT_GAP_MAX_INQ_LEN, 0) == ESP_OK;
+    esp_err_t ret;            
+    ret = esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, timeout, 0);
+    if(ret != ESP_OK) {
+        log_i("discover Async error: %s", esp_err_to_name(ret));
+    }
+    return ret == ESP_OK;
+}
+
+bool BluetoothSerial::discoverInProgress() {
+	return xEventGroupGetBits(_bt_event_group) & BT_DISCOVERY_RUNNING;
 }
 
 /** @brief      Stops the asynchronous discovery and clears the callback */
@@ -1150,7 +1221,7 @@ BluetoothSerial::operator bool() const
  * SDP scan address
  * esp_spp_start_discovery doesn't tell us the btAddress in the callback, so we have to wait until it's finished
  */
-std::map<int, std::string> BluetoothSerial::getChannels(const BTAddress &remoteAddress) {
+std::map<int, std::string>& BluetoothSerial::getChannels(const BTAddress &remoteAddress) {
     if(xEventGroupGetBits(_bt_event_group) & BT_SDP_RUNNING) {
         log_e("getChannels failed - already running");
     }
@@ -1172,4 +1243,31 @@ std::map<int, std::string> BluetoothSerial::getChannels(const BTAddress &remoteA
     return sdpRecords;
 }
 
+/**
+ * @brief      Gets the MAC address of local BT device in byte array.
+ *
+ * @param      mac [out]  The mac
+ */
+void BluetoothSerial::getBtAddress(uint8_t *mac) {
+    const uint8_t *dev_mac = esp_bt_dev_get_address();
+    memcpy(mac, dev_mac, ESP_BD_ADDR_LEN);
+}
+/**
+ * @brief      Gets the MAC address of local BT device as BTAddress object.
+ *
+ * @return     The BTAddress object.
+ */
+BTAddress BluetoothSerial::getBtAddressObject() {
+    uint8_t mac_arr[ESP_BD_ADDR_LEN];
+    getBtAddress(mac_arr);
+    return BTAddress(mac_arr);
+}
+/**
+ * @brief      Gets the MAC address of local BT device as string.
+ *
+ * @return     The BT MAC address string.
+ */
+String BluetoothSerial::getBtAddressString() {
+    return getBtAddressObject().toString(true);
+}
 #endif
