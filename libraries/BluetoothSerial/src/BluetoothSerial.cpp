@@ -54,7 +54,7 @@ static TaskHandle_t _spp_task_handle = NULL;
 static EventGroupHandle_t _spp_event_group = NULL;
 static EventGroupHandle_t _bt_event_group = NULL;
 static boolean secondConnectionAttempt;
-static esp_spp_cb_t custom_spp_callback = NULL;
+static esp_spp_cb_t * custom_spp_callback = NULL;
 static BluetoothSerialDataCb custom_data_callback = NULL;
 static esp_bd_addr_t current_bd_addr;
 static ConfirmRequestCb confirm_request_callback = NULL;
@@ -590,9 +590,10 @@ static void esp_bt_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *pa
             }
             break;
 
-        case ESP_BT_GAP_MODE_CHG_EVT:
+        case ESP_BT_GAP_MODE_CHG_EVT: {
+            char bda_str[18];
             log_i("ESP_BT_GAP_MODE_CHG_EVT: remote addr: %s, mode: %d", bda2str(param->mode_chg.bda, bda_str, sizeof(bda_str)), param->mode_chg.mode);
-            break;
+            break; }
 
         default:
             log_i("ESP-BT_GAP_* unknown message: %d", event);
@@ -600,7 +601,7 @@ static void esp_bt_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *pa
     }
 }
 
-static bool _init_bt(const char *deviceName, bt_mode mode)
+static bool _init_bt(const char *deviceName, esp_bt_mode_t mode)
 {
     if(!_bt_event_group){
         _bt_event_group = xEventGroupCreate();
@@ -818,7 +819,7 @@ bool BluetoothSerial::begin(String localName, bool noServer, bool disableBLE)
     if (localName.length()){
         local_name = localName;
     }
-    return _init_bt(local_name.c_str(), disableBLE ? BT_MODE_CLASSIC_BT : BT_MODE_BTDM);
+    return _init_bt(local_name.c_str(), disableBLE ? ESP_BT_MODE_CLASSIC_BT : ESP_BT_MODE_BTDM);
 }
 
 int BluetoothSerial::available(void)
@@ -915,7 +916,7 @@ void BluetoothSerial::confirmReply(boolean confirm)
 }
 
 
-esp_err_t BluetoothSerial::register_callback(esp_spp_cb_t callback)
+esp_err_t BluetoothSerial::register_callback(esp_spp_cb_t * callback)
 {
     custom_spp_callback = callback;
     return ESP_OK;

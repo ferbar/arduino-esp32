@@ -16,13 +16,17 @@
 #define _ESP32_ESP32_HAL_BT_H_
 
 #include "esp32-hal.h"
+#include "esp_bt.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+//typedef enum {BT_MODE_DEFAULT, BT_MODE_BLE, BT_MODE_CLASSIC_BT, BT_MODE_BTDM } bt_mode;
+
 bool btStarted();
 bool btStart();
+bool btStartMode(esp_bt_mode_t mode);
 bool btStop();
 
 #ifdef __cplusplus
